@@ -14,7 +14,7 @@ import { COINGECKO_ATTRIBUTION } from '@/services/coingecko/types.js';
 export const listMarketsTool = tool('coingecko_list_markets', {
   title: 'coingecko-mcp-server: list markets',
   description:
-    'Ranked market table — top coins sorted by market cap, volume, or 24h price change, optionally filtered to a category. The entry point for "top 20 DeFi coins" or "biggest gainers today". Returns standard market fields per coin (price, cap, volume, supply, 24h/1h/7d change, ATH/ATL). Discover valid category slugs with coingecko_list_categories and pass the category_id exactly.',
+    'Ranked market table — top coins sorted by market cap or volume, optionally filtered to a category. Returns standard market fields per coin (price, cap, volume, supply, 24h/1h/7d change, ATH/ATL). Discover valid category slugs with coingecko_list_categories and pass the category_id exactly.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   errors: [
@@ -39,12 +39,12 @@ export const listMarketsTool = tool('coingecko_list_markets', {
         'market_cap_asc',
         'volume_desc',
         'volume_asc',
-        'price_change_percentage_24h_desc',
-        'price_change_percentage_24h_asc',
+        'id_desc',
+        'id_asc',
       ])
       .default('market_cap_desc')
       .describe(
-        'Sort order. Use price_change_percentage_24h_desc for top gainers, _asc for top losers.',
+        'Sort order: market_cap_desc (default), market_cap_asc, volume_desc, volume_asc, id_desc, id_asc.',
       ),
     category: z
       .string()
