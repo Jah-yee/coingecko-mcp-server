@@ -1,7 +1,7 @@
 /**
  * @fileoverview coingecko_list_categories — list CoinGecko's coin categories
  * (category_id + display name), the valid slugs for coingecko_list_markets's
- * category filter. ~800 categories; name_contains filters the complete list
+ * category filter. name_contains filters the complete list
  * locally by strict token match.
  * @module src/mcp-server/tools/definitions/list-categories.tool
  */
@@ -24,7 +24,7 @@ function normalize(s: string): string {
 export const listCategoriesTool = tool('coingecko_list_categories', {
   title: 'coingecko-mcp-server: list categories',
   description:
-    'List CoinGecko\'s coin categories (category_id + display name) — the valid slugs for coingecko_list_markets\'s category filter. ~800 categories; pass name_contains to filter the list locally by name (e.g. "defi", "layer 1", "gaming") with strict token matching, instead of scanning all of them. Use the returned category_id exactly when filtering markets.',
+    'List CoinGecko\'s coin categories (category_id + display name) — the valid slugs for coingecko_list_markets\'s category filter. Pass name_contains to filter the list locally by name (e.g. "defi", "layer 1", "gaming") with strict token matching. Use the returned category_id exactly when filtering markets.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   errors: [...COINGECKO_SERVICE_ERRORS],
@@ -61,7 +61,7 @@ export const listCategoriesTool = tool('coingecko_list_categories', {
     notice: z
       .string()
       .optional()
-      .describe('Guidance when the filter matched nothing — suggests browsing unfiltered.'),
+      .describe('Full-catalog narrowing guidance or recovery when a filter matched nothing.'),
   },
 
   async handler(input, ctx) {
@@ -71,6 +71,9 @@ export const listCategoriesTool = tool('coingecko_list_categories', {
 
     const filter = input.name_contains?.trim();
     if (!filter) {
+      ctx.enrich.notice(
+        `Full catalog: ${all.length} categories. Narrow discovery with name_contains, for example "gaming" or "layer 1".`,
+      );
       return { categories: all, attribution: COINGECKO_ATTRIBUTION };
     }
 

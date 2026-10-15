@@ -127,10 +127,14 @@ export interface RawCoinMarketData {
   market_cap?: Record<string, number | null>;
   max_supply?: number | null;
   price_change_percentage_1y?: number | null;
+  price_change_percentage_1y_in_currency?: Record<string, number | null> | null;
   price_change_percentage_7d?: number | null;
+  price_change_percentage_7d_in_currency?: Record<string, number | null> | null;
   price_change_percentage_14d?: number | null;
   price_change_percentage_24h?: number | null;
+  price_change_percentage_24h_in_currency?: Record<string, number | null> | null;
   price_change_percentage_30d?: number | null;
+  price_change_percentage_30d_in_currency?: Record<string, number | null> | null;
   price_change_percentage_60d?: number | null;
   price_change_percentage_200d?: number | null;
   total_supply?: number | null;
@@ -366,7 +370,7 @@ export interface ChartPoint {
   value: number;
 }
 
-export type ChartGranularity = 'minutely' | 'hourly' | 'daily';
+export type ChartGranularity = '5-minute' | 'hourly' | 'daily' | 'irregular' | 'unknown';
 
 export interface MarketChartResult {
   marketCaps: ChartPoint[];

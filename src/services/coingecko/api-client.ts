@@ -5,8 +5,8 @@
  *
  * `fetchWithTimeout` throws a classified `McpError` on any non-OK status (it only
  * returns the `Response` when `response.ok`), so this client keys off the THROWN
- * error's code, not a status check on a response it never receives. It maps the
- * three probe-confirmed error envelopes:
+ * error's code, not a status check on a response it never receives. It preserves
+ * framework status/retry decisions and adds code-specific recovery. Examples:
  *   - 404 `{"error":"coin not found"}` → NotFound. `getJsonOrNull` swallows this to
  *     `null` so the calling tool can throw a typed `coin_not_found` /
  *     `unknown_category`; `getJson` rethrows it enriched.
@@ -18,9 +18,13 @@
  */
 
 import { JsonRpcErrorCode, McpError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import { fetchWithTimeout, requestContextService } from '@cyanheads/mcp-ts-core/utils';
+import {
+  defaultIsTransient,
+  fetchWithTimeout,
+  requestContextService,
+} from '@cyanheads/mcp-ts-core/utils';
 
-import { type CoinGeckoServiceReason, recoveryFor } from './error-contracts.js';
+import { COINGECKO_SERVICE_ERRORS, recoveryFor } from './error-contracts.js';
 import { COINGECKO_API_BASE } from './types.js';
 
 const USER_AGENT = 'coingecko-mcp-server (+https://github.com/cyanheads/coingecko-mcp-server)';
@@ -98,8 +102,8 @@ export class CoinGeckoApiClient {
   /**
    * Single fetch attempt. `fetchWithTimeout` throws a classified `McpError` on any
    * non-OK status; we enrich it with the contract `reason` + recovery so clients
-   * get the same actionable hint a handler-level `ctx.fail` would carry. A raw
-   * network/timeout failure (no `McpError`) maps to `upstream_unreachable`.
+   * get the same actionable hint a handler-level `ctx.fail` would carry. Raw
+   * network failures map to `upstream_unreachable`; timeouts stay distinct.
    * `expectedStatuses` lists statuses the caller treats as an expected outcome —
    * they still throw unchanged but log at debug instead of error.
    */
@@ -134,22 +138,64 @@ export class CoinGeckoApiClient {
 
   /**
    * Attach a contract `reason` + recovery hint to a `fetchWithTimeout` error,
-   * preserving its status-derived code, message, captured body, and `Retry-After`.
-   * 429 → `rate_limited`; everything else (5xx, timeout, unexpected) →
-   * `upstream_unreachable`. A NotFound passes through unchanged — `getJsonOrNull`
-   * swallows it to `null` and `getJson`'s callers don't expect a 404, so leaving
-   * its code intact keeps auto-classification honest.
+   * preserving its framework code, retry decision, captured body, and Retry-After.
+   * Only confirmed JSON envelope messages become a bounded plain-text explanation.
    */
   private enrich(error: McpError, path: string): McpError {
-    const reason: CoinGeckoServiceReason =
-      error.code === JsonRpcErrorCode.RateLimited ? 'rate_limited' : 'upstream_unreachable';
+    if (error.code === JsonRpcErrorCode.RequestCancelled) return error;
+    const retryable = defaultIsTransient(error);
+    const reason =
+      error.data?.errorSource === 'FetchSignalTimeout'
+        ? 'upstream_deadline'
+        : error.code === JsonRpcErrorCode.ServiceUnavailable
+          ? retryable
+            ? 'upstream_unreachable'
+            : 'upstream_http_error'
+          : COINGECKO_SERVICE_ERRORS.find((entry) => entry.code === error.code)?.reason;
+    if (!reason) return error;
+    const body = error.data?.responseBody ?? error.data?.body;
+    let explanation: string | undefined;
+    let historyLimit = false;
+    if (typeof body === 'string' && body.length <= 4096) {
+      try {
+        const envelope = JSON.parse(body);
+        const status = envelope?.status ?? envelope?.error?.status;
+        historyLimit = status?.error_code === 10012;
+        const message =
+          typeof envelope?.error === 'string' ? envelope.error : status?.error_message;
+        if (typeof message === 'string') {
+          // Bound first: sanitizing a diagnostic never scans an unbounded body.
+          explanation = Array.from(message.slice(0, 300).replace(/<[^>]*>/g, ''))
+            .map((char) =>
+              char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127 || char === '<' || char === '>'
+                ? ' '
+                : char,
+            )
+            .join('')
+            .trim();
+        }
+      } catch {
+        /* Opaque/HTML bodies remain diagnostics, never promoted as advice. */
+      }
+    }
     const data = {
       ...(error.data as Record<string, unknown> | undefined),
       path,
       reason,
+      retryable,
       ...recoveryFor(reason),
+      ...(historyLimit && {
+        recovery: {
+          hint: 'Request only the most recent 365 days; move the start date inside that window and retry the narrower range.',
+        },
+      }),
     };
-    return new McpError(error.code, error.message, data, { cause: error });
+    return new McpError(
+      error.code,
+      explanation ? `${error.message}. CoinGecko: ${explanation}` : error.message,
+      data,
+      { cause: error },
+    );
   }
 
   /**
@@ -158,7 +204,10 @@ export class CoinGeckoApiClient {
    * non-retryable SerializationError.
    */
   private async parseJson<T>(response: Response, path: string): Promise<T> {
-    const text = await response.text();
+    const text = await response.text().catch((error: unknown) => {
+      if (error instanceof McpError) throw this.enrich(error, path);
+      throw error;
+    });
     if (/^\s*<(!doctype\s+html|html[\s>])/i.test(text)) {
       throw serviceUnavailable(
         'CoinGecko returned an HTML body instead of JSON — likely rate-limited.',

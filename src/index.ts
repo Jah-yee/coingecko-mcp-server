@@ -39,7 +39,7 @@ await createApp({
   // serves stateless. An explicit MCP_SESSION_MODE still overrides this.
   sessionMode: 'stateless',
   instructions:
-    'Cryptocurrency market data from CoinGecko (v3 REST API). CoinGecko keys all data by slug (bitcoin, ethereum), NOT by ticker (BTC, ETH) — and tickers are not unique. Resolve any name or ticker to a slug with coingecko_search_coins FIRST, then chain the returned id into the ID-keyed tools (coingecko_get_prices, coingecko_get_coin, coingecko_get_market_chart). coingecko_get_prices reports any unresolved ids in its missing field rather than erroring. Data refreshes ~every 60s (not tick-level). Runs keyless by default; set COINGECKO_API_KEY for a higher rate ceiling. Data provided by CoinGecko.',
+    'Cryptocurrency market data from CoinGecko (v3 REST API). CoinGecko keys all data by slug (bitcoin, ethereum), NOT by ticker (BTC, ETH) — and tickers are not unique. Resolve any name or ticker to a slug with coingecko_search_coins FIRST, then chain the returned id into the ID-keyed tools (coingecko_get_prices, coingecko_get_coin, coingecko_get_market_chart, coingecko_list_markets). coingecko_get_prices reports partial unresolved IDs in missing; all unresolved IDs or resolved coins without numeric quotes produce distinct errors. Data refreshes ~every 60s (not tick-level). Runs keyless by default; set COINGECKO_API_KEY for a higher rate ceiling. Data provided by CoinGecko.',
   landing: {
     requireAuth: false,
     tagline:

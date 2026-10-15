@@ -32,6 +32,8 @@ export const getGlobalTool = tool('coingecko_get_global', {
   input: z.object({
     vs_currency: z
       .string()
+      .trim()
+      .toLowerCase()
       .min(1)
       .default('usd')
       .describe(

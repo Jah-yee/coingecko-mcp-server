@@ -28,22 +28,34 @@ export const getCoinTool = tool('coingecko_get_coin', {
       recovery:
         'Verify the slug with coingecko_search_coins — IDs are slugs (bitcoin), not tickers (BTC).',
     },
+    {
+      reason: 'unsupported_currency',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'Market data was selected, the coin has no quote key, and the supported-currency catalog excludes the code.',
+      recovery: 'Use a supported currency code such as "usd", "eur", or "btc" for market data.',
+      retryable: false,
+      thrownBy: 'service',
+    },
     ...COINGECKO_SERVICE_ERRORS,
   ],
 
   input: z.object({
     id: z
       .string()
+      .trim()
+      .toLowerCase()
       .min(1)
       .describe(
         'CoinGecko slug (e.g. "ethereum"). Not a ticker — resolve with coingecko_search_coins.',
       ),
     vs_currency: z
       .string()
+      .trim()
+      .toLowerCase()
       .min(1)
       .default('usd')
       .describe(
-        'Currency for the market-data figures (price, cap, ATH/ATL). Single currency; defaults to "usd".',
+        'Currency for market prices, cap, ATH/ATL, and every percentage-change window. Single currency; defaults to "usd". Missing quotes remain absent for supported currencies. Ignored when market is not selected.',
       ),
     sections: z
       .array(z.enum(SECTIONS))
@@ -122,7 +134,7 @@ export const getCoinTool = tool('coingecko_get_coin', {
             d1y: z.number().optional().describe('1-year price change percentage, when available.'),
           })
           .describe(
-            'Multi-window price change percentages (each field present only when upstream provides it).',
+            'Multi-window price change percentages in vs_currency; zero is preserved, null/missing values are omitted. USD may use a legacy scalar only when its entire currency map is absent.',
           ),
       })
       .optional()
@@ -170,7 +182,13 @@ export const getCoinTool = tool('coingecko_get_coin', {
 
   async handler(input, ctx) {
     ctx.log.info('coingecko_get_coin', { id: input.id, sections: input.sections });
-    const detail = await getCoinGeckoService().coinDetail(input.id, input.vs_currency, ctx);
+    const marketSelected = !input.sections?.length || input.sections.includes('market');
+    const detail = await getCoinGeckoService().coinDetail(
+      input.id,
+      input.vs_currency,
+      ctx,
+      marketSelected,
+    );
     if (!detail) {
       throw ctx.fail('coin_not_found', `Coin "${input.id}" not found.`, {
         id: input.id,

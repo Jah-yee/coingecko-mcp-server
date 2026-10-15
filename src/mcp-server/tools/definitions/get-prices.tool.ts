@@ -15,10 +15,17 @@ import { COINGECKO_ATTRIBUTION } from '@/services/coingecko/types.js';
 export const getPricesTool = tool('coingecko_get_prices', {
   title: 'coingecko-mcp-server: get prices',
   description:
-    'Current price and core market stats (market cap, 24h volume, 24h change) for one or more coins in one or more fiat/crypto currencies. Batch-friendly — pass a whole portfolio in one call (up to 250 ids). IDs must be CoinGecko slugs (bitcoin, ethereum), not tickers; resolve unknown tickers with coingecko_search_coins first. Any requested ids that returned no data are reported in the missing field (a wrong slug yields a silent upstream miss, not an error), so a typo reads as "unresolved", not "nonexistent".',
+    'Current price and core market stats (market cap, 24h volume, 24h change) across coin/currency batches. Accepts up to 500 raw IDs, processes the first 250 unique normalized IDs, and discloses skipped IDs separately. IDs are CoinGecko slugs (bitcoin, ethereum); resolve unknown tickers with coingecko_search_coins first. Partial unresolved IDs appear in missing; all unresolved IDs or resolved coins without numeric quotes produce distinct errors.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   errors: [
+    {
+      reason: 'no_price_data',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'Some requested IDs resolved, but no numeric price was returned for the requested currencies.',
+      recovery:
+        'Check the requested currency codes or retry later; resolved coins may have no current quotes.',
+    },
     {
       reason: 'all_missing',
       code: JsonRpcErrorCode.NotFound,
@@ -31,14 +38,14 @@ export const getPricesTool = tool('coingecko_get_prices', {
 
   input: z.object({
     ids: z
-      .array(z.string().min(1))
+      .array(z.string().trim().toLowerCase().min(1))
       .min(1)
-      .max(250)
+      .max(500)
       .describe(
-        'CoinGecko slugs to price (e.g. ["bitcoin","ethereum"]). Not tickers — resolve with coingecko_search_coins. Up to 250 per call.',
+        'CoinGecko slugs to price (e.g. ["bitcoin","ethereum"]). Accepts up to 500 raw entries; the first 250 unique normalized IDs are processed and the rest disclosed as skipped. Resolve tickers with coingecko_search_coins.',
       ),
     vs_currencies: z
-      .array(z.string().min(1))
+      .array(z.string().trim().toLowerCase().min(1))
       .min(1)
       .default(['usd'])
       .describe('Currency codes to price against (e.g. ["usd","eur","btc"]). Defaults to ["usd"].'),
@@ -83,6 +90,10 @@ export const getPricesTool = tool('coingecko_get_prices', {
   }),
 
   enrichment: {
+    skippedIds: z
+      .array(z.string())
+      .optional()
+      .describe('Normalized IDs beyond the 250 unique-ID processing cap; not upstream misses.'),
     notice: z
       .string()
       .optional()
@@ -91,28 +102,47 @@ export const getPricesTool = tool('coingecko_get_prices', {
       ),
   },
 
+  enrichmentTrailer: {
+    skippedIds: { render: (ids) => (ids ? `**Skipped IDs:** ${ids.join(', ')}` : '') },
+  },
+
   async handler(input, ctx) {
     ctx.log.info('coingecko_get_prices', {
       idCount: input.ids.length,
       currencies: input.vs_currencies,
     });
-    const result = await getCoinGeckoService().simplePrice(input.ids, input.vs_currencies, ctx);
+    const uniqueIds = [...new Set(input.ids)];
+    const ids = uniqueIds.slice(0, 250);
+    const skippedIds = uniqueIds.slice(250);
+    const currencies = [...new Set(input.vs_currencies)];
+    const result = await getCoinGeckoService().simplePrice(ids, currencies, ctx);
 
-    if (result.missing.length === input.ids.length) {
+    if (result.missing.length === ids.length) {
       throw ctx.fail(
         'all_missing',
-        `None of the ${input.ids.length} requested id(s) returned data.`,
-        { missing: result.missing },
+        `None of the ${ids.length} processed id(s) returned data.${skippedIds.length ? ` Skipped IDs beyond the cap: ${skippedIds.join(', ')}.` : ''}`,
+        { missing: result.missing, skippedIds },
+      );
+    }
+    if (result.rows.length === 0) {
+      throw ctx.fail(
+        'no_price_data',
+        `Resolved coins returned no numeric quotes for ${currencies.join(', ')}.${result.missing.length ? ` Unresolved processed IDs: ${result.missing.join(', ')}.` : ''}${skippedIds.length ? ` Skipped IDs beyond the cap: ${skippedIds.join(', ')}.` : ''}`,
+        { missing: result.missing, skippedIds },
       );
     }
 
-    // Currencies that returned no row for ANY resolved coin were silently dropped
-    // upstream (an unsupported vs_currency yields no key rather than an error) —
-    // disclose them so a bad currency code isn't mistaken for a flat market.
+    // Missing quotes can mean an unsupported currency or unavailable market data.
     const returnedCurrencies = new Set(result.rows.map((r) => r.currency));
-    const droppedCurrencies = input.vs_currencies.filter((c) => !returnedCurrencies.has(c));
+    const droppedCurrencies = currencies.filter((c) => !returnedCurrencies.has(c));
 
     const notices: string[] = [];
+    if (skippedIds.length > 0) {
+      ctx.enrich({ skippedIds });
+      notices.push(
+        `Processed the first ${ids.length} unique IDs; ${skippedIds.length} IDs were skipped beyond the 250-ID cap.`,
+      );
+    }
     if (result.missing.length > 0) {
       notices.push(
         `No data for id(s): ${result.missing.join(', ')}. These slugs are unknown to CoinGecko or returned a silent miss — re-resolve them with coingecko_search_coins (IDs are slugs like "bitcoin", not tickers like "BTC").`,
@@ -120,7 +150,7 @@ export const getPricesTool = tool('coingecko_get_prices', {
     }
     if (droppedCurrencies.length > 0) {
       notices.push(
-        `No data for currenc(ies): ${droppedCurrencies.join(', ')}. CoinGecko silently drops unsupported currency codes — check the code (e.g. "usd", "eur", "btc").`,
+        `No numeric quotes for currenc(ies): ${droppedCurrencies.join(', ')}. Check the currency codes or retry later; absence can also mean unavailable price data.`,
       );
     }
     if (notices.length > 0) {

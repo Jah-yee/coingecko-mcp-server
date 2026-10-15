@@ -18,6 +18,14 @@ export const coinResource = resource('coingecko://coin/{id}', {
 
   errors: [
     {
+      reason: 'unsupported_currency',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'The coin lacks a USD quote key and the supported-currency catalog excludes USD.',
+      recovery: 'Use a supported currency code such as "usd", "eur", or "btc" for market data.',
+      retryable: false,
+      thrownBy: 'service',
+    },
+    {
       reason: 'coin_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'Upstream returned 404 for the slug — it is not a recognized CoinGecko id.',
@@ -27,7 +35,21 @@ export const coinResource = resource('coingecko://coin/{id}', {
   ],
 
   params: z.object({
-    id: z.string().min(1).describe('CoinGecko slug (e.g. "bitcoin").'),
+    id: z
+      .string()
+      .transform((id, ctx) => {
+        try {
+          return decodeURIComponent(id).trim().toLowerCase();
+        } catch {
+          ctx.addIssue({
+            code: 'custom',
+            message: 'Coin ID contains invalid URI percent encoding.',
+          });
+          return z.NEVER;
+        }
+      })
+      .pipe(z.string().min(1))
+      .describe('CoinGecko slug (e.g. "bitcoin"), with URI escapes decoded before normalization.'),
   }),
 
   async handler(params, ctx) {

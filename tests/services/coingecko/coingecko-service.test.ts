@@ -18,6 +18,8 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async () => {
 
 const { CoinGeckoApiClient } = await import('@/services/coingecko/api-client.js');
 const { CoinGeckoService } = await import('@/services/coingecko/coingecko-service.js');
+const { COINGECKO_SERVICE_ERRORS } = await import('@/services/coingecko/error-contracts.js');
+const { defaultIsTransient } = await import('@cyanheads/mcp-ts-core/utils');
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -83,6 +85,15 @@ describe('search', () => {
 });
 
 describe('simplePrice — silent-miss detection', () => {
+  it('normalizes IDs/currencies before request and missing comparison (#13)', async () => {
+    mockFetchWithTimeout.mockResolvedValueOnce(jsonResponse({ bitcoin: { usd: 1 } }));
+    const out = await makeService().simplePrice([' Bitcoin ', 'bitcoin'], [' USD ', 'usd'], ctx);
+    expect(out.rows).toEqual([{ id: 'bitcoin', currency: 'usd', price: 1 }]);
+    expect(out.missing).toEqual([]);
+    const url = new URL(mockFetchWithTimeout.mock.calls[0]?.[0]);
+    expect(url.searchParams.get('ids')).toBe('bitcoin');
+    expect(url.searchParams.get('vs_currencies')).toBe('usd');
+  });
   it('flattens rows and reports a wrong slug as missing (200 {} upstream)', async () => {
     // bitcoin present; "notacoin" omitted entirely by upstream.
     mockFetchWithTimeout.mockResolvedValueOnce(
@@ -128,6 +139,27 @@ describe('simplePrice — silent-miss detection', () => {
 });
 
 describe('coinsMarkets', () => {
+  it('sends IDs with order and pagination (#15)', async () => {
+    mockFetchWithTimeout.mockResolvedValueOnce(jsonResponse([]));
+    await makeService().coinsMarkets(
+      {
+        ids: [' Bitcoin ', 'bitcoin', 'ethereum'],
+        vsCurrency: ' USD ',
+        order: 'id_asc',
+        page: 2,
+        perPage: 1,
+      },
+      ctx,
+    );
+    const url = new URL(mockFetchWithTimeout.mock.calls[0]?.[0]);
+    expect(Object.fromEntries(url.searchParams)).toMatchObject({
+      ids: 'bitcoin,ethereum',
+      vs_currency: 'usd',
+      order: 'id_asc',
+      page: '2',
+      per_page: '1',
+    });
+  });
   it('normalizes and omits null fields; prefers in-currency 24h change', async () => {
     mockFetchWithTimeout.mockResolvedValueOnce(
       jsonResponse([
@@ -337,6 +369,31 @@ describe('global', () => {
 });
 
 describe('marketChart', () => {
+  it.each(['auto', 'daily', 'hourly'] as const)(
+    'forwards interval=%s on both endpoints with normalized IDs (#6/#13)',
+    async (interval) => {
+      const raw = {
+        prices: [
+          [1789516800000, 75590.24471973324],
+          [1789603200000, 76146.81236783884],
+        ],
+        market_caps: [],
+        total_volumes: [],
+      };
+      mockFetchWithTimeout
+        .mockResolvedValueOnce(jsonResponse(raw))
+        .mockResolvedValueOnce(jsonResponse(raw));
+      const service = makeService();
+      await service.marketChart(' Bitcoin ', ' USD ', 30, ctx, interval);
+      await service.marketChartRange(' Bitcoin ', ' USD ', 1789516800, 1789603200, ctx, interval);
+      for (const [url] of mockFetchWithTimeout.mock.calls) {
+        const parsed = new URL(url);
+        expect(parsed.pathname).toContain('/coins/bitcoin/market_chart');
+        expect(parsed.searchParams.get('vs_currency')).toBe('usd');
+        expect(parsed.searchParams.get('interval')).toBe(interval === 'auto' ? null : interval);
+      }
+    },
+  );
   it('maps point pairs to {t, value} and returns null on 404', async () => {
     mockFetchWithTimeout.mockResolvedValueOnce(
       jsonResponse({
@@ -366,6 +423,20 @@ describe('marketChart', () => {
  */
 describe('api-client HTTP error classification', () => {
   const client = () => new CoinGeckoApiClient({ timeoutMs: 5000 });
+
+  it('matches malformed JSON to its declared transient contract (#2)', async () => {
+    mockFetchWithTimeout.mockResolvedValueOnce(new Response('broken-json'));
+    const error = await client()
+      .getJson('op', '/global', undefined, undefined)
+      .catch((e) => e);
+    const contract = COINGECKO_SERVICE_ERRORS.find((entry) => entry.reason === 'invalid_response');
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.data.reason).toBe('invalid_response');
+    expect(error.data.recovery.hint).toBe(contract?.recovery);
+    expect(contract?.retryable).toBe(true);
+    expect(defaultIsTransient(error)).toBe(true);
+    expect(contract?.code).toBe(error.code);
+  });
 
   it('maps 429 to a retryable RateLimited error with the rate_limited reason', async () => {
     mockFetchWithTimeout.mockRejectedValueOnce(

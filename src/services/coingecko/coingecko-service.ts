@@ -36,14 +36,24 @@ import type {
 const BASE_DELAY_MS = 1500;
 const TIMEOUT_MS = 15_000;
 const MAX_RETRIES = 3;
+const COIN_DEADLINE_MS = 50_000;
 
 /** Reads `vs_currency` from a per-currency map, treating null as absent. */
 function pickCurrency(
-  map: Record<string, number | null> | undefined,
+  map: Record<string, number | null> | null | undefined,
   currency: string,
 ): number | undefined {
   const v = map?.[currency];
   return typeof v === 'number' ? v : undefined;
+}
+
+/** Legacy scalar changes are USD-only, and only replace a wholly absent map. */
+function pickChange(
+  map: Record<string, number | null> | null | undefined,
+  usdScalar: number | null | undefined,
+  currency: string,
+): number | undefined {
+  return map === undefined && currency === 'usd' ? num(usdScalar) : pickCurrency(map, currency);
 }
 
 function pickDate(
@@ -122,6 +132,8 @@ export class CoinGeckoService {
     vsCurrencies: string[],
     ctx: Context,
   ): Promise<SimplePriceResult> {
+    ids = [...new Set(ids.map((id) => id.trim().toLowerCase()))];
+    vsCurrencies = [...new Set(vsCurrencies.map((currency) => currency.trim().toLowerCase()))];
     const raw = await this.retry('coingecko.simplePrice', ctx, () =>
       this.client.getJson<RawSimplePrice>(
         'coingecko.simplePrice',
@@ -180,6 +192,7 @@ export class CoinGeckoService {
   async coinsMarkets(
     params: {
       vsCurrency: string;
+      ids?: string[];
       order: string;
       category?: string;
       page: number;
@@ -188,7 +201,10 @@ export class CoinGeckoService {
     ctx: Context,
   ): Promise<MarketCoin[] | null> {
     const query = {
-      vs_currency: params.vsCurrency,
+      vs_currency: params.vsCurrency.trim().toLowerCase(),
+      ...(params.ids && {
+        ids: [...new Set(params.ids.map((id) => id.trim().toLowerCase()))].join(','),
+      }),
       order: params.order,
       ...(params.category && { category: params.category }),
       page: params.page,
@@ -246,21 +262,66 @@ export class CoinGeckoService {
    * tool can throw a typed `coin_not_found`. `currency` selects the scalar to
    * pull from the per-currency `market_data` maps.
    */
-  async coinDetail(id: string, currency: string, ctx: Context): Promise<CoinDetail | null> {
-    const raw = await this.retry('coingecko.coinDetail', ctx, () =>
-      this.client.getJsonOrNull<RawCoinDetail>(
-        'coingecko.coinDetail',
-        `/coins/${encodeURIComponent(id)}`,
-        {
-          localization: false,
-          tickers: false,
-          market_data: true,
-          community_data: true,
-          developer_data: true,
-          sparkline: false,
-        },
-        ctx.signal,
-      ),
+  async coinDetail(
+    id: string,
+    currency: string,
+    ctx: Context,
+    marketSelected = true,
+  ): Promise<CoinDetail | null> {
+    id = id.trim().toLowerCase();
+    currency = currency.trim().toLowerCase();
+    const raw = await withRetry(
+      async ({ signal }) => {
+        const boundedCtx = { ...ctx, signal };
+        const record = await this.retry('coingecko.coinDetail', boundedCtx, () =>
+          this.client.getJsonOrNull<RawCoinDetail>(
+            'coingecko.coinDetail',
+            `/coins/${encodeURIComponent(id)}`,
+            {
+              localization: false,
+              tickers: false,
+              market_data: true,
+              community_data: true,
+              developer_data: true,
+              sparkline: false,
+            },
+            signal,
+          ),
+        );
+        if (
+          record &&
+          marketSelected &&
+          !Object.hasOwn(record.market_data?.current_price ?? {}, currency)
+        ) {
+          const supported = await this.retry('coingecko.supportedCurrencies', boundedCtx, () =>
+            this.client.getJson<string[]>(
+              'coingecko.supportedCurrencies',
+              '/simple/supported_vs_currencies',
+              undefined,
+              signal,
+            ),
+          );
+          if (!supported.includes(currency)) {
+            throw notFound(`CoinGecko does not support quote currency "${currency}".`, {
+              reason: 'unsupported_currency',
+              currency,
+              recovery: {
+                hint: 'Use a supported currency code such as "usd", "eur", or "btc" for market data.',
+              },
+              retryable: false,
+            });
+          }
+        }
+        return record;
+      },
+      {
+        operation: 'coingecko.coinDetail',
+        maxRetries: 0,
+        // Deadline envelope only: retain the inner request's retries and error metadata.
+        isTransient: () => false,
+        signal: ctx.signal,
+        deadlineMs: COIN_DEADLINE_MS,
+      },
     );
     if (!raw) return null;
 
@@ -298,10 +359,26 @@ export class CoinGeckoService {
       },
       market: {
         priceChangePct: omitUndefined({
-          d24h: num(md?.price_change_percentage_24h),
-          d7d: num(md?.price_change_percentage_7d),
-          d30d: num(md?.price_change_percentage_30d),
-          d1y: num(md?.price_change_percentage_1y),
+          d24h: pickChange(
+            md?.price_change_percentage_24h_in_currency,
+            md?.price_change_percentage_24h,
+            currency,
+          ),
+          d7d: pickChange(
+            md?.price_change_percentage_7d_in_currency,
+            md?.price_change_percentage_7d,
+            currency,
+          ),
+          d30d: pickChange(
+            md?.price_change_percentage_30d_in_currency,
+            md?.price_change_percentage_30d,
+            currency,
+          ),
+          d1y: pickChange(
+            md?.price_change_percentage_1y_in_currency,
+            md?.price_change_percentage_1y,
+            currency,
+          ),
         }),
         ...omitUndefined({
           currentPrice: pickCurrency(md?.current_price, currency),
@@ -356,12 +433,19 @@ export class CoinGeckoService {
     vsCurrency: string,
     days: number | 'max',
     ctx: Context,
+    interval: 'auto' | 'daily' | 'hourly' = 'auto',
   ): Promise<MarketChartResult | null> {
+    id = id.trim().toLowerCase();
+    vsCurrency = vsCurrency.trim().toLowerCase();
     const raw = await this.retry('coingecko.marketChart', ctx, () =>
       this.client.getJsonOrNull<RawMarketChart>(
         'coingecko.marketChart',
         `/coins/${encodeURIComponent(id)}/market_chart`,
-        { vs_currency: vsCurrency, days: String(days) },
+        {
+          vs_currency: vsCurrency,
+          days: String(days === 'max' ? 365 : days),
+          ...(interval !== 'auto' && { interval }),
+        },
         ctx.signal,
       ),
     );
@@ -374,12 +458,15 @@ export class CoinGeckoService {
     from: number,
     to: number,
     ctx: Context,
+    interval: 'auto' | 'daily' | 'hourly' = 'auto',
   ): Promise<MarketChartResult | null> {
+    id = id.trim().toLowerCase();
+    vsCurrency = vsCurrency.trim().toLowerCase();
     const raw = await this.retry('coingecko.marketChartRange', ctx, () =>
       this.client.getJsonOrNull<RawMarketChart>(
         'coingecko.marketChartRange',
         `/coins/${encodeURIComponent(id)}/market_chart/range`,
-        { vs_currency: vsCurrency, from, to },
+        { vs_currency: vsCurrency, from, to, ...(interval !== 'auto' && { interval }) },
         ctx.signal,
       ),
     );
@@ -430,6 +517,7 @@ export class CoinGeckoService {
    * `0` total (which would misreport the entire market as worthless).
    */
   async global(currency: string, ctx: Context): Promise<GlobalMarket> {
+    currency = currency.trim().toLowerCase();
     const raw = await this.retry('coingecko.global', ctx, () =>
       this.client.getJson<RawGlobalResponse>('coingecko.global', '/global', undefined, ctx.signal),
     );
