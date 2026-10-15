@@ -4,7 +4,13 @@
 /.agents/
 /.cache/
 /framework-skills/
-/docs/idea.md
+/src/
+/tests/
+/scripts/
+/docs/
+/CLAUDE.md
+/AGENTS.md
+/node_modules/.vitest-cache/
 /logs/
 /Dockerfile
 /bun.lock
